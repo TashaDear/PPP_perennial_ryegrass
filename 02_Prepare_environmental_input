@@ -1,0 +1,170 @@
+#WP1
+#Natasha Johansen
+#Date: 
+#############################################################
+library(dplyr)
+library(factoextra) 
+library(ggpubr)
+library(tidyr)
+library(BGGE)
+library(foreach)
+library(raster)
+library(nasapower)
+library(EnvRtype)
+library(lubridate)
+library(doParallel)
+registerDoParallel(cores=6)
+#############################################################        
+#A) Paths
+#############################################################
+
+path             = "Desktop" #change path
+
+#############################################################        
+#B) Prepare dataframes
+#############################################################
+
+#Coordinates
+country          = c("NOR","EST","SWE","LTU","ISL","DNK")                       
+env_id           = c('Norway','Estonia', 'Sweden', 'Lithuania', 'Iceland', 'Denmark') 
+lat_deg          = c(60, 58, 55, 55, 64, 55)                                 
+lat_min          = c(45, 45, 56, 23, 9,  20)                                            
+long_deg         = c(11, 26, 13, 23,-21, 12)                                           
+long_min         = c(12, 24, 6,  52,-45, 23) 
+sowing_date      = c("2014-06-20",  "2014-08-02", "2014-05-28", "2014-06-10", "2014-07-09", "2014-06-25")
+
+#Convert to decimal degrees
+env_data         = data.frame(country, env_id, lat_deg, lat_min, long_deg, long_min) %>%
+                   mutate(lat     = lat_deg  + lat_min/60, 
+                          lon     = long_deg + long_min/60, 
+                          country = as.character(country),
+                          env_id  = as.character(env_id))
+
+env_data         = get_weather(env.id = env_data$env_id, lat = env_data$lat, lon = env_data$lon, start.day = rep("2014-01-01",7), end.day = rep("2016-12-31",7))
+
+env_data         = param_temperature(env.data = env_data, Tbase1 = 3.2, Tbase2 = 10, Topt1  = 30, Topt2  = 52, merge = TRUE) 
+env_data         = param_radiation(env.data   = env_data, merge  = TRUE)
+env_data         = param_atmospheric(env.data = env_data, Alt    = c(187, 68, 65, 33, 35, 35), merge = TRUE)
+
+variables        = c("T2M","T2M_MAX", "T2M_MIN", "PRECTOT", "WS2M", "RH2M", "T2MDEW", "n", "N",
+                     "ALLSKY_SFC_LW_DWN", "ALLSKY_SFC_SW_DWN", "FRUE","T2M_RANGE","RTA","VPD","SPV","ETP","PETP") 
+
+#############################################################
+#C) Prepare for submission
+#############################################################
+
+env_data_sub    = env_data %>% dplyr::select(-c("n.1", "N.1", "RTA.1", "VPD.1")) 
+write.csv(env_data_sub, file = "PPP_perennial_ryegrass_environment_data.csv", row.names = FALSE)
+ 
+#############################################################        
+#D) Reaction norm approach
+#############################################################
+
+create_W_matrix = function(trait) {
+  
+  if(trait == "yield") {
+    
+    print(paste("Trait is :", trait))
+    
+    input            = env_data %>% filter(YYYYMMDD >= as.Date("2014-09-01") & YYYYMMDD <= as.Date("2016-08-31")) %>%
+                       mutate(year = case_when(YYYYMMDD >= as.Date("2014-09-01") & YYYYMMDD < as.Date("2015-09-01") ~ 2015,
+                                               YYYYMMDD >= as.Date("2015-09-01") & YYYYMMDD < as.Date("2016-09-01") ~ 2016, TRUE ~ NA_integer_)) 
+    
+    windows          = c(seq(243, 573, by = 30), seq(608, 938, by = 30))
+    
+    names_windows    = c("A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L")  
+    
+  } else {
+    
+    print(paste("Trait is not yield")) 
+    
+    input            = env_data %>%filter(YYYYMMDD >= as.Date("2014-09-01") & YYYYMMDD <= as.Date("2016-05-31")) %>%
+                       filter(!(YYYYMMDD >= as.Date("2015-06-01") & YYYYMMDD <= as.Date("2015-08-31"))) %>% 
+                       mutate(year = case_when(YYYYMMDD >= as.Date("2014-09-01") & YYYYMMDD < as.Date("2015-09-01") ~ 2015, 
+                                               YYYYMMDD >= as.Date("2015-09-01") & YYYYMMDD < as.Date("2016-09-01") ~ 2016, TRUE ~ NA_integer_))
+    
+    windows          = c(seq(243, 483, by = 30), 516 ,seq(638, 848, by = 30))  
+    
+    names_windows    = c("A", "B", "C", "D", "E", "F", "G", "H", "I", "A", "B", "C", "D", "E", "F", "G", "H", "I")  }
+  
+  input_upd          = input %>% mutate(YEAR = year(YYYYMMDD), MM = month(YYYYMMDD), DD = day(YYYYMMDD)) %>% 
+                       mutate(country_year = paste(env, year, sep = "_")) %>% mutate(env = country_year) 
+
+W_feature        = W_matrix(env.data     = input_upd, 
+                           var.id       = variables, 
+                           #probs        = c(.01,.25,.50,.99),                                 
+                           statistic    = 'mean',   
+                           env.id       = 'country_year',
+                           by.interval  = TRUE,
+                           time.window  = windows,
+                           names.window = names_windows,
+                           is.processed = FALSE,
+                           center       = T, 
+                           scale        = T, 
+                           QC           = FALSE)
+  
+ W_matrix        =  env_kernel(W_feature, env.id = 'country_year', gaussian = FALSE)[[2]]
+  
+return(W_matrix) }
+#############################################################        
+#E) Envirotyping matrix
+#############################################################
+
+create_E_matrix  = function(trait) {
+  
+if(trait == "yield") {
+  
+print(paste("Trait is :", trait))
+  
+input            = env_data %>% filter(YYYYMMDD >= as.Date("2014-09-01") & YYYYMMDD <= as.Date("2016-08-31")) %>%
+                   mutate(year = case_when(YYYYMMDD >= as.Date("2014-09-01") & YYYYMMDD < as.Date("2015-09-01") ~ 2015,
+                                           YYYYMMDD >= as.Date("2015-09-01") & YYYYMMDD < as.Date("2016-09-01") ~ 2016, TRUE ~ NA_integer_)) 
+
+windows          = c(seq(243, 573, by = 30), seq(608, 938, by = 30))
+
+names_windows    = c("A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L", "A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L")  
+
+} else {
+  
+print(paste("Trait is not yield")) 
+   
+input            = env_data %>%filter(YYYYMMDD >= as.Date("2014-09-01") & YYYYMMDD <= as.Date("2016-05-31")) %>%
+                   filter(!(YYYYMMDD >= as.Date("2015-06-01") & YYYYMMDD <= as.Date("2015-08-31"))) %>% 
+                   mutate(year = case_when(YYYYMMDD >= as.Date("2014-09-01") & YYYYMMDD < as.Date("2015-09-01") ~ 2015,
+                                           YYYYMMDD >= as.Date("2015-09-01") & YYYYMMDD < as.Date("2016-09-01") ~ 2016, TRUE ~ NA_integer_)) 
+  
+windows          = c(seq(243, 483, by = 30), 516 ,seq(638, 848, by = 30)) 
+  
+names_windows    = c("A", "B", "C", "D", "E", "F", "G", "H", "I", "A", "B", "C", "D", "E", "F", "G", "H", "I")  }
+
+input_upd        = input %>% mutate(YEAR = year(YYYYMMDD), MM = month(YYYYMMDD), DD = day(YYYYMMDD)) %>%
+                   mutate(country_year = paste(env, year, sep = "_")) %>% mutate(env = country_year) 
+
+E_feature        = env_typing(env.data    = input_upd,  
+                              env.id      = "country_year",
+                              var.id      = variables,
+                              days.id     = "daysFromStart",
+                              quantiles   = c(0.05, 0.25, 0.5, 0.95), #v2
+                              by.interval = TRUE,
+                              time.window = windows,
+                              names.window= names_windows, 
+                              format      = 'wide', 
+                              scale       = TRUE)                             
+
+E_matrix          = env_kernel(E_feature, env.id = 'country_year', gaussian = FALSE)[[2]]
+
+return(E_matrix) }
+#############################################################        
+#F) Run functions
+#############################################################     
+
+W_yield          = create_W_matrix("yield")
+W_WIK_SPC        = create_W_matrix("not_yield")
+
+E_yield          = create_E_matrix("yield")
+E_WIK_SPC        = create_E_matrix("not_yield")
+
+EC_matrices      = list("W_yield" = W_yield, "W_WIK_SPC" = W_WIK_SPC, "E_yield" = E_yield, "E_WIK_SPC" = E_WIK_SPC)
+
+saveRDS(EC_matrices, paste0(path "EC_matrices_v2.rds"))
+############################################################# 
