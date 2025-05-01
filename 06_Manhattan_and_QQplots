@@ -1,0 +1,263 @@
+#WP1
+#Natasha Johansen
+#Date: 
+#############################################################
+library(CMplot)
+library(cowplot)
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(grid)
+library(gridExtra)
+library(jpeg)
+library(qqplotr)
+library(stringr)
+library(tibble)
+library(tidyr)
+library(tidyverse)
+library(viridis)
+#############################################################
+#A) Paths and load input 
+#############################################################
+
+path             = "/home/tasha/QGG_plants/ppp_updated/"
+path_input       = paste0(path, "results/model_output/GWAS/")
+path_matrices    = paste0(path, "input/matrices/")
+path_results     = paste0(path, "results/")
+
+#Load input
+GWAS_marginal    = readRDS(paste0(path_input, "GWAS_marginal_final.rds"))
+GWAS_conditional = readRDS(paste0(path_input, "GWAS_conditional_final.rds"))
+
+traits           = c("TDM3", "SpringCover", "WinterKill")
+n                = ncol(readRDS(paste0(path_matrices, "Kinships_and_geno.rds"))[["A_centered"]])
+ 
+#############################################################
+#B) Extract pvalues for marginal effects 
+#############################################################
+
+Extract_pvalues_marginal = function(GWAS) {
+
+pval_output      = data.frame()
+
+for(trait in traits) {
+print(trait) 
+
+current_GWAS     = GWAS[[trait]]
+
+SNP_results      = lapply(names(current_GWAS), function(SNP) {
+
+tryCatch({
+sig              = aod::wald.test(Sigma = current_GWAS[[SNP]]$VarBeta, b = current_GWAS[[SNP]]$Beta, 
+                   Terms = which(names(current_GWAS[[SNP]]$Beta) %in% c("Additive")))$result$chi2["P"]
+
+data.table("Pval"= sig, "trait" = trait, "SNP" = SNP, "Analysis" = "Marginal")  }, error = function(e) {
+data.table("Pval"= NA,  "trait" = trait, "SNP" = SNP, "Analysis" = "Marginal")  }) }) 
+
+SNP_results      = rbindlist(SNP_results)
+pval_output      = rbind(pval_output, SNP_results) }
+
+return(pval_output) }
+
+#############################################################
+#C) Extract pvalues for conditional effects 
+#############################################################
+
+Extract_pvalues_conditional = function(GWAS) {
+
+pval_output      = data.frame()
+
+for(trait in traits) {
+print(trait) 
+
+current_GWAS     = GWAS[[trait]]
+
+SNP_results      = lapply(names(current_GWAS), function(SNP) {
+        
+VarBeta          = current_GWAS[[SNP]]$VarBeta
+Beta             = current_GWAS[[SNP]]$Beta
+
+terms_to_use     = which(rownames(VarBeta) %in% c("Additive:countryDenmark", 
+                                                  "Additive:countryEstonia", 
+                                                  "Additive:countryFinland", #Finland removed from analysis
+                                                  "Additive:countryIceland",
+                                                  "Additive:countryLithuania", 
+                                                  "Additive:countryNorway",
+                                                  "Additive:countrySweden"))
+                                            
+sig              = aod::wald.test(Sigma = VarBeta, b = Beta, Terms = c(terms_to_use))$result$chi2["P"]
+
+data.table("Pval"= sig, "trait" = trait, "SNP" = SNP, "Analysis" = "Conditional") }) 
+
+SNP_results      = rbindlist(SNP_results)
+
+pval_output      = rbind(pval_output, SNP_results) }
+
+pval_output      = pval_output %>% as.data.frame() 
+
+return(pval_output) }
+
+#############################################################
+#D) Run functions
+#############################################################
+
+pval_marginal    = Extract_pvalues_marginal(GWAS_marginal) %>% as.data.frame() %>% split(.$trait)
+saveRDS(pval_marginal,  paste0(path_input, "GWAS_marginal_pvalues.rds"))
+
+pval_conditional = Extract_pvalues_conditional(GWAS_conditional) %>% as.data.frame() %>% split(.$trait)
+saveRDS(pval_conditional, paste0(path_input,"GWAS_conditional_pvalues.rds"))
+
+#############################################################
+#E) Manhattan plots
+#############################################################
+
+colors           = viridis(10)
+color_vector     = c("Marginal" = colors[1], "Conditional" = colors[5])
+
+Mplot            = list()
+pvalues          = data.frame()
+  
+for(trait in traits){  
+   
+#Calculate FDR     
+pval_marginal[[trait]]$FDR    = p.adjust(pval_marginal[[trait]]$Pval, "fdr")        
+pval_conditional[[trait]]$FDR = p.adjust(pval_conditional[[trait]]$Pval,"fdr") 
+
+#Prepare table  
+temp_output      = rbind(pval_marginal[[trait]], pval_conditional[[trait]]) %>% filter(FDR <= 0.10) 
+pvalues          = rbind(temp_output, pvalues)
+
+#Prepare input for Manhattan plot
+current_data     = rbind(pval_marginal[[trait]], pval_conditional[[trait]]) %>% 
+                   mutate(Chr = str_extract(SNP, "^[^_]+"), Position = sub(".*_", "", SNP)) %>%
+                   mutate(Analysis = factor(Analysis, levels = c("Marginal", "Conditional")))  
+ 
+Mplot[[trait]]   = ggplot() + 
+                   geom_point(data = current_data, aes(x = Position, y = -log10(FDR), colour = Analysis), alpha = 0.75, size =1.5) +
+                   facet_grid(. ~ Chr, scales = "free_x", space = "free_x") + 
+                   geom_hline(yintercept  = -log10(0.05), linetype = "dashed", color = "black") +
+                   geom_hline(yintercept  = -log10(0.10), linetype = "dashed", color = "grey") +
+                   theme(axis.text.x      = element_blank(),
+                   panel.background       = element_blank(),
+                   panel.grid.major       = element_blank(), 
+                   panel.grid.minor       = element_blank(),
+                   axis.line              = element_line(colour = "black"),
+                   strip.background       = element_blank(),
+                   plot.title             = element_text(size = 14, hjust = 0.5)) + ylim(0, 4) +
+                   scale_color_manual(values = color_vector) +
+                   ylab(expression(-Log[10] ~ "(FDR)")) +
+                   ggtitle(trait)  }
+  
+All_traits_plot  = ggpubr::ggarrange(Mplot[["TDM3"]],Mplot[["SpringCover"]],Mplot[["WinterKill"]],ncol=3,nrow=1,common.legend=TRUE,legend="bottom")  
+All_traits_plot  = ggpubr::annotate_figure(All_traits_plot, top = text_grob(""))  
+ggsave(paste0(path_results, "figures/GWAS/Manhattan_final.png"), plot = All_traits_plot, width = 24, height = 8, unit = 'cm')
+
+pvalues_upd      = pvalues %>% 
+                   select(c("Analysis", "trait", "SNP", "Pval", "FDR")) %>% 
+                   mutate(CHR     = str_extract(SNP, "^[^_]+"), POS = sub(".*_", "", SNP),
+                          FDR     = format(as.numeric(FDR),  scientific = TRUE, digits = 3),
+                          Pval    = format(as.numeric(Pval), scientific = TRUE, digits = 3)) %>%
+                   mutate(Pval = as.numeric(Pval), FDR = as.numeric(FDR)) %>%
+                   mutate(threshold = case_when(FDR <= 0.10 & FDR > 0.05 ~0.10, FDR <= 0.05 & FDR > 0.01 ~0.05, FDR <= 0.01 ~0.01,TRUE ~NA_real_)) %>% 
+                   arrange(trait, Analysis, CHR, POS, SNP, Pval, FDR) %>%
+                   distinct(trait, Analysis, CHR, POS, SNP, Pval, FDR)
+
+saveRDS(pvalues_upd, paste0(path_input, "Pvalues_significant.rds")) 
+
+#############################################################
+#F) QQplots
+#############################################################
+
+for(trait in traits) {
+                      
+data              = rbind(pval_marginal[[trait]], pval_conditional[[trait]])                       
+
+current_data      = data %>% 
+                    mutate(SNP_name = SNP, Chr = str_extract(SNP, "^[^_]+"), Position = sub(".*_", "", SNP)) %>% 
+                    select(c("SNP_name", "Chr", "Position", "Pval", "Analysis")) %>% 
+                    pivot_wider(names_from = Analysis, values_from = Pval) %>% filter(!is.na(Marginal))
+                    
+      CMplot(Pmap = current_data, ylab = plot_title, ylim = c(0,10), col = color_vector, plot.type = c("q"),
+                    threshold = c(0.05/n), threshold.col = c('black'), threshold.lwd = 2, 
+                    points.alpha = 75, signal.cex = 3, multraits = T, multracks = F, amplify = TRUE,
+                    file.output = TRUE, main = , file = "jpg", file.name = paste0(trait ,"_Additive")) }
+
+#############################################################
+#G) Combined QQplots
+#############################################################
+
+current_path      = paste0(getwd(), "/")
+file_paths        = c(paste0(current_path, "Multi-traits_QQplot.TDM3_Additive.jpg"),
+                      paste0(current_path, "Multi-traits_QQplot.SpringCover_Additive.jpg"), 
+                      paste0(current_path, "Multi-traits_QQplot.WinterKill_Additive.jpg"))
+               
+titles            = str_extract(file_paths, "(?<=QQplot\\.)[A-Za-z0-9_]+(?=_Additive)")
+plots             = lapply(seq_along(file_paths), function(i) {
+  
+tryCatch({
+img               = jpeg::readJPEG(file_paths[i])
+
+                    ggplot() + annotation_custom(rasterGrob(img), xmin=-Inf, xmax=Inf, ymin=-Inf, ymax=Inf) + ggtitle(titles[i]) + 
+                    theme(plot.title       =element_text(size =7, hjust =0.5), 
+                          panel.background =element_rect(fill ="white", color =NA),)}, error=function(e) { cat("Error:", conditionMessage(e),"\n") })})
+
+combined_plot     = ggarrange(plotlist = plots, ncol = 3, nrow = 1, common.legend = TRUE, legend = "bottom")
+combined_plot     = combined_plot + theme(plot.background = element_rect(fill = "white", color = NA))
+
+ggsave(paste0(path_results, "figures/GWAS/QQ_plots_final.jpg"), plot = combined_plot, width = 6, height = 2, units = "in")
+
+#############################################################
+#H) Prepare input for conditional plots
+#############################################################
+
+Conditional_df    = data.frame() 
+for(current_trait in traits) {
+
+current_pval      = pvalues_upd %>% filter(Analysis == "Conditional") %>% filter(trait == current_trait)
+
+for(SNP in unique(current_pval$SNP)) {
+
+Sigma             = GWAS_conditional[[current_trait]][[SNP]]$VarBeta
+colnames(Sigma)   = rownames(Sigma)
+Sigma             = diag(Sigma) %>% as.data.frame() %>% rename("Sigma" = ".") %>% rownames_to_column("Country")
+Beta              = GWAS_conditional[[current_trait]][[SNP]]$Beta %>% as.data.frame() %>% rename("Beta" = ".") %>% rownames_to_column("Country")
+
+temp              = Sigma %>% left_join(Beta, by = "Country") %>%
+                    filter(!Country %in% c("PC1", "PC2", "PC3", "Additive", "country", 
+                                           "countryDenmark", "countryEstonia", "countryFinland", "countryLithuania", "countryIceland", 
+                                           "countrySweden", "countryNorway", "(Intercept)", "year2015", "year2016")) %>%
+                    mutate(trait = current_trait, SNP = SNP, SE = sqrt(Sigma), Country = str_replace(Country, "Additive:country", ""))
+
+Conditional_df    = rbind(Conditional_df, temp) }}
+
+Conditional_input = pvalues_upd[,c("trait", "SNP", "Analysis", "Pval", "FDR")] %>% 
+                    filter(Analysis == "Conditional") %>% 
+                    left_join(Conditional_df, by = c("SNP", "trait")) 
+  
+#Select three most significant SNPs for each trait                    
+Prioritized_SNPs  = Conditional_input %>% distinct(trait, SNP, Pval, FDR) %>% group_by(trait) %>% slice_min(Pval, n = 3) %>% ungroup()
+Conditional_sub   = Conditional_input %>% semi_join(Prioritized_SNPs, by = c("trait", "SNP")) 
+                                      
+#############################################################
+#I) Prepare plot for conditional effects
+#############################################################
+       
+desired_order     = c("Denmark", "Iceland", "Lithuania", "Norway", "Sweden", "Estonia")
+country_colors    = c("Norway"="#A50026", "Estonia"="#D73027", "Sweden"="#F46D43", "Lithuania"="#74ADD1", "Iceland"="#4575B4", "Denmark"="#313695")
+                                           
+Con_sub_plot      = ggplot(Conditional_sub, aes(x = Country, y = Beta, color = Country)) +
+                    geom_point() + 
+                    geom_errorbar(aes(ymin = Beta - SE, ymax = Beta + SE), width = 0.2) + 
+                    theme_bw() + 
+                    facet_wrap(trait ~ SNP, ncol = 3, nrow = 3, scales = "free_x") +
+                    theme(legend.position = "bottom",
+                          axis.text.x     = element_blank(),
+                          plot.title      = element_text(hjust = 0.5)) +
+                    scale_color_manual(values = country_colors) +
+                    geom_hline(yintercept  = 0, linetype = "dashed", color = "red") +
+                    guides(color = guide_legend(nrow = 1)) +
+                    labs(x = "", y = "Effect size +/- SE")             
+ggsave(paste0(path_results,"figures/GWAS/Conditional_effects_final.png"), plot = Con_sub_plot,width = 16, height = 14, unit = 'cm')
+                   
+#############################################################
