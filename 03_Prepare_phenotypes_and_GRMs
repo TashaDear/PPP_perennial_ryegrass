@@ -1,0 +1,270 @@
+#WP1
+#Natasha Johansen
+#Date:
+#############################################################
+library(data.table)  
+library(dendextend)  
+library(dplyr)   
+library(ggplot2)    
+library(grid)    
+library(factoextra)
+library(missMethods) 
+library(psych)  
+library(RColorBrewer)
+library(viridis)
+library(tibble)   
+library(tidyr)
+#############################################################
+#A) Paths
+#############################################################
+
+set.seed(0)
+
+path                     = "/home/tasha/QGG_plants/ppp_updated/" #change path
+
+path_passport            = paste0(path, "rawdata_v2/sample_info/") 
+path_input               = paste0(path, "input/BLUES/")
+path_vcf                 = paste0(path, "vcf/")
+path_matrices            = paste0(path, "input/matrices/")
+path_LD                  = paste0(path, "results/model_output/LD/")
+path_figures             = paste0(path, "results/figures/")
+
+#############################################################
+#B) Functions
+#############################################################
+
+#Function to update column names of the Allele depth inputs
+update_AD_colnames       = function(df) {
+
+colnames(df)             = colnames(df) %>% gsub("\\.fastq\\.gz\\.sai:AD|\\.gz\\.sai:AD", "", .) %>% gsub("^\\[\\d+\\]", "", .) %>%
+                           gsub(".*?CHROM", "CHROM", .)
+return(df) }
+
+#Function to process AD matrix
+process_AD_matrix        = function(df) {
+df                       = df %>% dplyr::mutate(Chr = gsub("^Lp_chr|_0$", "", CHROM)) %>%
+                                  dplyr::mutate(Chr_SNP = paste0(Chr, "_", POS)) %>%
+                                  tibble::column_to_rownames("Chr_SNP") %>%
+                                  dplyr::select(-CHROM, -POS, -Chr) %>%
+                                  dplyr::mutate_all(as.numeric) %>% t()
+}
+
+#############################################################
+#C) Read and prepare the data frame for the raw BLUEs
+#############################################################
+
+#Load passport info
+passport_info            = read.csv(paste0(path_passport, "PPP_perennial_ryegrass_passport_info_diploid.csv")) %>% 
+                           mutate(id = as.character(id))
+                                                       
+#Load raw BLUEs and filter out tetraploid accessions
+BLUES_combined           = readRDS(paste0(path_input,"PPP_perennial_ryegrass_BLUEs_raw.rds")) %>% 
+                           left_join(passport_info, by = "id") %>% filter(id %in% passport_info$id) 
+
+#############################################################
+#D) Read and prepare genotypes
+#############################################################
+
+#Load input (Allele depth)
+R                        = fread(paste0(path_vcf, "Allele_depth_REF.txt"), check.names= FALSE) %>%  as.data.frame() #Allele depth (REF allele) 
+A                        = fread(paste0(path_vcf, "Allele_depth_ALT.txt"), check.names= FALSE) %>%  as.data.frame() #Allele depth (ALT allele)
+
+#Update the sample names so they match passport
+AD0                      = update_AD_colnames(R) %>% process_AD_matrix()    
+AD1                      = update_AD_colnames(A) %>% process_AD_matrix()
+
+print(paste("SNPs", ncol(R)))
+
+stopifnot(colnames(R)    == colnames(A))
+stopifnot(row.names(R)   == row.names(A))
+
+#Use pseudo counts to account for low read depth
+freq                     = AD1/(AD0+AD1)
+freq_Pseudo              = (AD1+1)/(AD0+AD1+2)
+freq_Pseudo[is.na(freq)] = NA
+rownames(freq_Pseudo)    = gsub("_", "", rownames(freq_Pseudo))
+
+stopifnot(sum(is.na(freq_Pseudo)) == sum(is.na(freq)))
+
+#Update rownames so the accession id's in geno matrix and the phenotype dataframe matches                                               
+rownames(freq_Pseudo)    = BLUES_combined$id[match(rownames(freq_Pseudo), BLUES_combined$Accession_name_vcf)]
+geno_diploid             = freq_Pseudo[unique(BLUES_combined$id),]
+
+#Mean imputation
+freq_mean_impute         = impute_mean(geno_diploid , type = "columnwise", convert_tibble = FALSE)
+saveRDS(freq_mean_impute, paste0(path_matrices, "freq_mean_impute.rds"))
+
+#############################################################
+#E) Prepare genomic relationship matrices (GRM)
+#############################################################
+
+A_diploid                 = 2*freq_mean_impute
+
+A_centered_diploid        = A_diploid %>% scale(., center = TRUE, scale = FALSE)
+
+GRM_A_diploid             = tcrossprod(A_centered_diploid)/(tr(tcrossprod(A_centered_diploid))/nrow(A_centered_diploid))
+ 
+D_diploid                 = 2*freq_mean_impute*(1-freq_mean_impute) #2pq
+
+D_centered_diploid        = D_diploid %>% scale(., center=TRUE, scale=FALSE)
+
+for (i in 1:ncol(D_centered_diploid)){   
+
+D_centered_diploid[,i]    = residuals(lm(D_centered_diploid[,i] ~ A_centered_diploid[,i])) }
+
+GRM_D_diploid             = tcrossprod(D_centered_diploid)/(tr(tcrossprod(D_centered_diploid))/nrow(D_centered_diploid))
+
+Kinships                  = list("GRM_A"      = GRM_A_diploid,      
+                                 "GRM_D"      = GRM_D_diploid, 
+                                 "A_centered" = A_centered_diploid, "D_centered" = D_centered_diploid)                                 
+saveRDS(Kinships, paste0(path_matrices, "Kinships_and_geno.rds"))
+
+#Calculate correlation between GRMs (off-diagonals)
+GRM_A_offdiag             = GRM_A_diploid[upper.tri(GRM_A_diploid)]
+GRM_D_offdiag             = GRM_D_diploid[upper.tri(GRM_D_diploid)]
+Off_diag_cor              = cor(as.vector(GRM_A_offdiag), as.vector(GRM_D_offdiag))
+
+print(paste("Off-diagonal correlation", Off_diag_cor))
+
+#############################################################
+#F) LD analysis 
+#############################################################
+
+prefixes                  = unique(sub("_.*", "", colnames(freq_mean_impute)))
+
+freq_mean_impute_list     = lapply(prefixes, function(prefix) {
+subset = freq_mean_impute[, grepl(paste0("^", prefix, "_"), colnames(freq_mean_impute)), drop = FALSE]
+subset })
+names(freq_mean_impute_list) = prefixes
+
+distance_list             = list()
+for(Chr in names(freq_mean_impute_list)) {
+distance_matrix           = matrix(nrow = 1, ncol = ncol(freq_mean_impute_list[[Chr]]))
+colnames(distance_matrix) = colnames(freq_mean_impute_list[[Chr]])
+distance_matrix[1,]       = as.numeric(sub(".*_", "", colnames(freq_mean_impute_list[[Chr]])))
+distance_list[[Chr]]      = dist(as.numeric(distance_matrix)) %>% as.matrix() }
+
+LD_output                 = data.frame()
+for(Chr in names(freq_mean_impute_list)) {
+
+R2_matrix                 = cor(freq_mean_impute_list[[Chr]])^2
+distance_matrix           = distance_list[[Chr]]
+                           
+output                    = cbind(R2_matrix[upper.tri(R2_matrix)], distance_matrix[upper.tri(distance_matrix)]) %>% 
+                            as.data.frame() %>% mutate("Chr" = Chr)
+colnames(output)          = c("R2", "D", "Chr")
+LD_output                 = rbind(LD_output, output) }  
+
+saveRDS(LD_output, paste0(path_LD, "LD_decay.rds"))  
+
+#Averge LD over distance (100 bps)
+LD_output_upd             = LD_output %>% as.data.frame() %>% mutate(bin = cut_width(x = D, 100, boundary = 0)) %>% 
+                            group_by(bin) %>% 
+                            summarise(mean_R2 = mean(R2, na.rm = TRUE)) %>% ungroup() %>% 
+                            mutate(end_interval = as.numeric(sub(".*,(.*?)]", "\\1", bin))) %>% 
+                            filter(end_interval < 10000) %>% na.omit() %>% 
+                            mutate(end_interval_kb = end_interval/1000)                                      
+saveRDS(LD_output_upd, paste0(path_LD, "LD_decay_upd.rds")) 
+
+#############################################################
+#G) Prepare clusters
+#############################################################
+
+Clust_GRM                 = freq_mean_impute %>% dist(method = "euclidean") %>% hclust(method = "ward.D") %>% as.dendrogram() %>% 
+                            color_branches(k = 10) %>% color_labels(k = 10)                         
+                            
+Clusters_10               = cutree(Clust_GRM, k = 10) %>% as.data.frame() %>% rownames_to_column("id") %>% rename("cluster_10" = ".")
+   
+sample_info               = BLUES_combined %>% left_join(Clusters_10, by = "id") %>% 
+                            distinct(id, cluster_10, Country_of_origin) %>% 
+                            mutate(across(c(cluster_10, Country_of_origin), as.factor))
+                             
+pca_A                     = prcomp(A_centered_diploid, center = T, scale = F) 
+PCs_geno_A                = pca_A$x %>% as.data.frame() %>% rownames_to_column("id") %>% left_join(., sample_info, by = "id")
+                                                        
+#############################################################
+#H) Prepare figures
+#############################################################
+
+LD_output_upd             = readRDS(paste0(path_LD, "LD_decay_upd.rds")) 
+                                                              
+LD_decay_plot             = ggplot(LD_output_upd, aes(x = end_interval_kb, y = mean_R2)) + geom_point(alpha = 0.5) + 
+                            labs(x = "Distance, kbp", y = "LD-decay", title = "") + 
+                            ylim(0, 1) + geom_hline(yintercept = 0.2, color = viridis(5)[4]) + 
+                            scale_x_continuous(labels = scales::number_format()) +
+                            theme_bw() 
+                                                                                                                                           
+PCA_clustering_plot       = PCs_geno_A %>% ggplot(aes(x = PC1, y = PC2)) +
+                            geom_point(aes(color = cluster_10), size = 2, alpha = 1) +
+                            xlab(sprintf("PC1 (%.2f%%)", pca_A$sdev[1] / sum(pca_A$sdev) * 100)) + xlim(-65, 85) +
+                            ylab(sprintf("PC2 (%.2f%%)", pca_A$sdev[2] / sum(pca_A$sdev) * 100)) + ylim(-70, 100) + 
+                            scale_color_manual(values =c(brewer.pal(11, "Spectral"), viridis(17))) +
+                            guides(color = guide_legend(ncol = 1)) +
+                            theme_bw() +
+                            theme(legend.position = "none", 
+                                  plot.title      = element_text(hjust = 0.5, size = 14, face = "bold")) 
+                                                                                   
+png(paste0(path_figures, "PCA/PCA_clustering_with_LD.png"), width = 7, height = 5, units = "in", res = 300)
+PCA_clustering_with_LD    = PCA_clustering_plot + annotation_custom(ggplotGrob(LD_decay_plot), xmin = 20, xmax = 90, ymin = 40, ymax = 120)
+print(PCA_clustering_with_LD)
+dev.off()
+
+#############################################################
+#I) Prepare phenotypes (unscaled and uncentered)
+#############################################################
+
+PCs                       = prcomp(freq_mean_impute, center = T, scale = F)$x %>%
+                            as.data.frame() %>% dplyr::select(c("PC1", "PC2", "PC3")) %>% rownames_to_column("id")  
+ 
+input_list                = BLUES_combined %>% 
+                            filter(country != "Finland") %>% 
+                            group_by(id) %>% mutate(core = if_else(n_distinct(country) == n_distinct(.$country), "yes", "no")) %>% ungroup() %>% 
+                            pivot_wider(id_cols = c(country, year, id, core), names_from = trait, values_from = predicted.value) %>%
+                            mutate(TDM3 = DM1 + DM2 + DM3) %>% select(-c("CrownRust", "DM1", "DM2", "DM3", "DM4", "SpringGrowth")) %>% 
+                            pivot_longer(cols = c(TDM3, SpringCover, WinterKill), names_to ="trait", values_to ="y") %>% filter(!is.na(y)) %>%
+                            left_join(PCs, by = "id") %>% left_join(Clusters_10, by = "id") %>%
+                            mutate(country_year    = paste0(country,"_", year),
+                                   id_country_year = paste0(id,":", country_year)) %>% 
+                            mutate(across(c("cluster_10", "id", "country", "year", "country_year", "id_country_year"), as.character)) %>% 
+                            mutate_at(vars(PC1, PC2, PC3, y), as.numeric) %>% 
+                            filter(!(trait == "WinterKill" & year == 2015)) %>% 
+                            split(.$trait)
+                                                        
+#Create random folds (10) for each trait
+for (trait in names(input_list)) {
+   
+clusters                  = split(unique(input_list[[trait]]$id),cut(sample(length(unique(input_list[[trait]]$id))), breaks = 10, labels = FALSE))
+cluster_mapping           = setNames(rep(paste0("Fold_", 1:10), lengths(clusters)), unlist(clusters))
+
+input_list[[trait]]["cluster_random"] = cluster_mapping[input_list[[trait]]$id] }  
+                                                                         
+#############################################################
+#J) Prepare phenotypes (scaled, centered and filtered)
+#############################################################
+
+#Data is normalized due to large management and year effects                                                              
+Final_data                = input_list %>% do.call(rbind, .) %>% 
+                            group_by(trait, country, year) %>%
+                            mutate(y_z_scaled = (y - mean(y[core == 'yes']))/sd(y[core == 'yes'])) %>%
+                            ungroup() %>% split(.$trait)   
+                                    
+saveRDS(Final_data, paste0(path_input, "PPP_perennial_ryegrass_phenotypes_final.rds"))   
+
+#Data for submission
+Final_data_filtered      = Final_data %>% do.call(rbind,.) %>% 
+                           select(c("country_year", "country", "id", "PC1", "PC2", "PC3", "core", "cluster_10", "cluster_random", "trait", "y")) 
+                     
+write.csv(Final_data_filtered, paste0(path_input, "PPP_perennial_ryegrass_phenotypes_final.csv"), row.names = FALSE) 
+
+#############################################################
+#K) Prepare tables
+#############################################################  
+
+Distinct_accessions      = Final_data_filtered %>% distinct(trait, country, id, core)
+core_accessions          = Distinct_accessions %>% filter(core == "yes") %>% distinct(id) %>% count()
+country_year_accessions  = Distinct_accessions %>% group_by(trait, country) %>% summarise(Accessions = n_distinct(id), .groups = "drop") %>%
+                           mutate("Accessions_core" = core_accessions)
+                           
+print(country_year_accessions)
+
+#############################################################
