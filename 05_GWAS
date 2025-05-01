@@ -1,0 +1,116 @@
+#WP1
+#Natasha Johansen
+#Date: 
+############################################################# 
+library("dplyr")
+library("MM4LMM")
+library("parallel")
+############################################################# 
+#A) Paths and input
+############################################################# 
+
+cores               = 30
+
+path                = "/home/tasha/QGG_plants/ppp_updated/"
+path_input          = paste0(path, "input/")
+path_output         = paste0(path, "results/model_output/GWAS/")
+
+Kinships            = readRDS(paste0(path_input, "matrices/Kinships_and_geno.rds"))
+phenotype_list      = readRDS(paste0(path_input, "BLUES/PPP_perennial_ryegrass_phenotypes_final.rds"))                     
+phenotype_df        = phenotype_list %>% do.call(rbind,.) %>% mutate(across(c(country, country_year), as.character))    
+                                       
+#############################################################        
+#B) Prepare kernels
+#############################################################
+
+create_kernel       = function(covariate) {
+Z                   = matrix(0, nrow = length(covariate), ncol = length(covariate))
+rownames(Z)         = colnames(Z) = covariate
+K                   = Matrix::tcrossprod(Z) %>% as.matrix()
+diag(K)             = 1
+return(K) }
+
+KC                  = create_kernel(unique(phenotype_df$country))
+KCY                 = create_kernel(unique(phenotype_df$country_year))
+
+############################################################# 
+#C) Marginal GWAS
+#############################################################
+
+   output_marginal    = list()
+   output_conditional = list()
+   
+   for(trait in names(phenotype_list)){
+   print(paste("trait is ", trait))
+
+   countries        = unique(phenotype_list[[trait]]$country)
+   
+   data             = phenotype_list[[trait]] %>% as.data.frame() %>% filter(!is.na(y)) %>% 
+                      mutate(across(c(id, country, country_year), as.character)) %>% 
+                      mutate(country = factor(country, levels = c("Estonia", setdiff(countries, "Estonia")))) 
+                      
+   KGA_upd          = Kinships[["GRM_A"]][data$id, data$id]
+   KGD_upd          = Kinships[["GRM_D"]][data$id, data$id]
+   
+   KC_upd           = KC[as.character(data$country), as.character(data$country)]
+   KCY_upd          = KCY[as.character(data$country_year), as.character(data$country_year)]
+                         
+   KGAC             = KGA_upd * KC_upd
+   KGDC             = KGD_upd * KC_upd
+   
+   rownames(KGAC)  <- colnames(KGAC) <- paste(data$id, data$country, sep = "_")   
+   rownames(KGDC)  <- colnames(KGDC) <- paste(data$id, data$country, sep = "_")          
+                                    
+   formula_mar      = as.formula('~ Additive + country + PC1 + PC2 + PC3') 
+   formula_con      = as.formula('~ Additive + Additive:country + country + PC1 + PC2 + PC3')                 
+                           
+   if(length(unique(data$year)) > 1) {
+   print("more than 1 year")
+                           
+   VL               = list("GRM_A"             = KGA_upd, 
+                           "GRM_D"             = KGD_upd, 
+                           "AdditivexCountry"  = KGAC, 
+                           "DominancexCountry" = KGDC, 
+                           "Country_year"      = KCY_upd,
+                           "Error"             = diag(1, nrow(data))) 
+                           
+   } else if(length(unique(data$year)) == 1) {
+   print("only 1 year")
+                     
+   VL               = list("GRM_A"             = KGA_upd, 
+                           "GRM_D"             = KGD_upd, 
+                           "AdditivexCountry"  = KGAC, 
+                           "DominancexCountry" = KGDC, 
+                           "Error"             = diag(1, nrow(data))) 
+   
+   }
+                                                                                                                        
+   A_centered_ext   = Kinships[["A_centered"]][data$id,] %>% as.matrix()
+   
+   SNP_input        = list()
+
+   for (i in 1:ncol(A_centered_ext)) {
+  
+   SNP_input[[i]]           = A_centered_ext[,i] %>% as.matrix()
+  
+   colnames(SNP_input[[i]]) = c("Additive")   
+   
+   names(SNP_input)[i]      = colnames(A_centered_ext)[i] } 
+                                                                                            
+   tryCatch({ 
+   
+   output_marginal[[trait]]    = MMEst(Y = data$y_z_scaled,
+                                 Cofactor= data, X = SNP_input, formula = formula_mar, VarList = VL, CritVar = 10e-5, NbCores = cores)
+                              
+   output_conditional[[trait]] = MMEst(Y = data$y_z_scaled,
+                                 Cofactor= data, X = SNP_input, formula = formula_con, VarList = VL, CritVar = 10e-5, NbCores = cores) },
+                                    
+   error = function(e) { print(paste("Error occurred:", e)) }) 
+   
+   saveRDS(output_marginal,    paste0(path_output, "GWAS_marginal_final.rds"))  
+   
+   saveRDS(output_conditional, paste0(path_output, "GWAS_conditional_final.rds"))
+    
+   } 
+
+#############################################################
