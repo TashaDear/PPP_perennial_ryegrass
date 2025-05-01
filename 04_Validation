@@ -1,0 +1,243 @@
+#WP1
+#Natasha Johansen
+#Date: 
+#############################################################
+library("dplyr")   #used
+library("foreach") #used
+library("MM4LMM")  #used
+library("tidyr")   #?
+library("tibble")  #used
+library("stringr") #used
+#############################################################
+#A) Paths, input and parameters
+#############################################################
+
+cores               = 30
+
+path                = "/home/tasha/QGG_plants/ppp_updated/"
+path_input          = paste0(path, "input/")
+path_output         = paste0(path, "results/model_output/")
+
+G_matrices          = readRDS(paste0(path_input, "matrices/Kinships_and_geno.rds"))
+EC_matrices         = readRDS(paste0(path_input, "matrices/EC_matrices_v2.rds")) #Only the envirotyping is changed
+
+phenotype_list      = readRDS(paste0(path_input, "BLUES/PPP_perennial_ryegrass_phenotypes_final.rds"))            
+
+#############################################################
+#B) Prepare Kernels
+#############################################################
+
+prepare_env_matrices= function(trait_type) {
+ 
+        if(trait_type == "yield") {
+W        = EC_matrices[["W_yield"]]
+E        = EC_matrices[["E_yield"]]
+
+ } else if(trait_type == "nonyield") {
+
+W        = EC_matrices[["W_WIK_SPC"]]
+E        = EC_matrices[["E_WIK_SPC"]]  }
+
+matrices = list("A" = G_matrices[["GRM_A"]], "D" = G_matrices[["GRM_D"]], "W"= W, "ET" = E)
+        
+AxW      = kronecker(matrices[["A"]], matrices[["W"]],  make.dimnames = TRUE)
+AxET     = kronecker(matrices[["A"]], matrices[["ET"]], make.dimnames = TRUE)
+DxW      = kronecker(matrices[["D"]], matrices[["W"]],  make.dimnames = TRUE)
+DxET     = kronecker(matrices[["D"]], matrices[["ET"]], make.dimnames = TRUE)
+
+kronck_matrices      = list("AxW" = AxW, "AxET" = AxET, "DxW"= DxW, "DxET" = DxET)
+  
+input_matrices       = c(matrices, kronck_matrices)
+
+for (i in names(input_matrices)) {
+  
+input_matrices[[i]]  = Matrix::nearPD(input_matrices[[i]])$mat %>% as.matrix() }
+
+covariance_matrices  = list("A"    = input_matrices[["A"]],
+                            "D"    = input_matrices[["D"]],
+                            "W"    = input_matrices[["W"]],
+                            "ET"   = input_matrices[["ET"]],
+                            "AxW"  = input_matrices[["AxW"]],
+                            "AxET" = input_matrices[["AxET"]],
+                            "DxW"  = input_matrices[["DxW"]],
+                            "DxET" = input_matrices[["DxET"]])  
+
+return(covariance_matrices) }
+#############################################################
+
+Kernels_yield        = prepare_env_matrices("yield")
+Kernels_nonyield     = prepare_env_matrices("nonyield")
+                                               
+#############################################################
+#C) Function to create incidence matrices and model list
+#############################################################
+
+create_incidence_mat = function(input_matrices, data, model) {
+  
+Z_G                  = t(sapply(as.character(data$id), function(x) as.numeric(rownames(input_matrices[["A"]]) == x)))
+Z_Env                = t(sapply(as.character(data$country_year), function(x) as.numeric(rownames(input_matrices[["W"]]) == x)))
+Z_GxEnv              = t(sapply(as.character(data$id_country_year), function(x) as.numeric(rownames(input_matrices[["AxW"]]) == x)))
+Z_error              = diag(1, nrow(data))
+  
+         if (model %in% c("M1A", "M1B")) {
+
+ZL                   = list("A" = Z_G, "Env" = Z_Env, "Error" = Z_error)
+    
+  } else if (model %in% c("M2A", "M2B")) {
+  
+ZL                   = list("A" = Z_G, "Env" = Z_Env, "AxEnv" = Z_GxEnv, "Error" = Z_error)
+    
+  } else if (model %in% c("M3A", "M3B")) {
+  
+ZL                   = list("A" = Z_G, "D" = Z_G, "Env" = Z_Env, "AxEnv" = Z_GxEnv, "DxEnv" = Z_GxEnv, "Error" = Z_error) }
+  
+return(ZL) }
+
+#Model list
+model_list           = list("M1A"   = c("A", "W"),
+                            "M1B"   = c("A", "ET"),
+                            "M2A"   = c("A", "W",  "AxW"),
+                            "M2B"   = c("A", "ET", "AxET"),
+                            "M3A"   = c("A", "D", "W",  "AxW",  "DxW"),
+                            "M3B"   = c("A", "D", "ET", "AxET", "DxET"))    
+                                  
+#############################################################
+#D) Full model
+#############################################################
+     
+   for(trait in names(phenotype_list)){
+   print(paste("trait is ", trait))
+   
+          if (trait %in% c("TDM3")) {
+   
+   covariance_matrices  = Kernels_yield
+   
+   } else if (trait %in% c("SpringCover", "WinterKill")) { 
+   
+   covariance_matrices  = Kernels_nonyield }
+   
+   output               = list()  
+  
+   for(model in names(model_list)) {
+   
+   output[[model]]      = list()
+    
+   data_input           = phenotype_list[[trait]] %>% as.data.frame() %>% filter(!is.na(y)) %>%
+                          mutate(across(c(id, country_year, id_country_year), as.character)) %>%
+                          mutate(year = factor(year, levels = c(2015, 2016)))
+      
+   ZL                   = create_incidence_mat(covariance_matrices, data_input, model)
+   
+   current_model        = model_list[[model]]
+
+   VL                   = covariance_matrices[current_model]  
+   VL[["Error"]]        = diag(1, nrow(data_input)) 
+   
+   tryCatch({ 
+           
+   output[[model]]      = MMEst(Y = data_input$y_z_scaled, Cofactor = data_input, formula = as.formula('~ 1'), ZList = ZL, VarList = VL) }, 
+                          error = function(e) { print(paste("Error:", e)) }) } 
+                                      
+   saveRDS(output, paste0(path_output,"Likelihoods/Likelihoods_", trait,".rds"))  }  
+
+#############################################################
+#E) Function for validation
+#############################################################
+
+Validation = function(input_list, validation_scheme) {
+
+  output   = data.frame()
+    
+  for(trait in names(input_list)) {
+  print(trait)
+  
+          if (trait %in% c("TDM3")) {
+   
+   covariance_matrices  = Kernels_yield
+   
+   } else if (trait %in% c("SpringCover", "WinterKill")) { 
+   
+   covariance_matrices  = Kernels_nonyield }
+  
+  data_subset           = input_list[[trait]] %>% mutate_at(vars("id", "country", "country_year", "id_country_year"), as.character) %>%
+                          mutate(year = factor(year, levels = c("2015", "2016")))
+              
+  folds                 = unique(data_subset[[validation_scheme]]) %>% na.omit() %>% as.vector()
+                               
+  for(current_fold in folds) {
+  
+  data_train            = data_subset %>% filter(.data[[validation_scheme]] != current_fold) 
+  data_test             = data_subset %>% filter(.data[[validation_scheme]] == current_fold) 
+  y_observed            = data_test %>% select(c("y_z_scaled", "id", "country_year"))       
+  
+  print(paste("data_train", nrow(data_train), "data_test", nrow(data_test)))                   
+  
+  formula               = as.formula('~ 1') 
+  X_test                = model.matrix(y_z_scaled ~ 1, data_test)                                                
+      
+  for(current_model in names(model_list)) {
+  
+  Z_train               = create_incidence_mat(covariance_matrices, data_train, current_model)
+  Z_test                = create_incidence_mat(covariance_matrices, data_test,  current_model)
+  Z_test[["Error"]]     = NULL
+
+  cov_list              = model_list[[current_model]]
+  V_list                = covariance_matrices[cov_list]
+  V_list[["Error"]]     = diag(1, nrow(data_train))
+         
+  tryCatch({
+   
+  fixed_effects         = MMEst(Y =data_train$y_z_scaled,                                                       
+                          Cofactor=data_train, formula = formula, ZList = Z_train, VarList = V_list, Method = "ML")
+                                
+  random_effects        = MMBlup(Y=data_train$y_z_scaled,                                                        
+                          Cofactor=data_train, fmla = formula,    ZList = Z_train, VarList = V_list, ResMM = fixed_effects)
+  
+  u_list                = random_effects[names(random_effects) != "Error"]
+  
+  b                     = fixed_effects[["NullModel"]][["Beta"]] %>% as.vector()
+  
+  BLUEs                 = (X_test %*% b) %>% as.data.frame() %>% rename("BLUEs" = "V1")
+  
+  BLUPs                 = NULL
+  
+  BLUPs                 = foreach(i = seq_along(u_list), .combine = `cbind`) %do% {
+  
+  out                   = Z_test[[i]] %*% u_list[[i]] %>% as.data.frame() %>% 
+                          rownames_to_column(var = names(Z_test)[i]) %>% 
+                          rename(!!paste0("BLUPs_", names(Z_test)[i]) := "V1") } %>%
+                          mutate(BLUPs = rowSums(select(., starts_with("BLUP")))) %>%
+                          mutate(A   = str_remove(A, "\\..*"),
+                                 A   = str_remove(A, "^X"),
+                                 Env = str_remove(Env, "\\..*")) %>% 
+                          rename("country_year" = "Env") %>% 
+                          rename("id" = "A") 
+                          
+   BLUPs                = BLUPs %>% select(-intersect(names(BLUPs), c("D", "AxEnv", "DxEnv")))
+                          
+   for (col in c("BLUPs_D", "BLUPs_DxEnv", "BLUPs_AxEnv")) {
+   if (!(col %in% colnames(BLUPs))) BLUPs[[col]] <- NA }
+                      
+  effect                = cbind(BLUEs, BLUPs) %>% as.data.frame() %>% 
+                          mutate(ypred = BLUEs + BLUPs) %>% 
+                          left_join(y_observed, by = c("id", "country_year")) %>%
+                          rename("yobs" = "y_z_scaled") %>%                                                    
+                          mutate("trait" = trait, "model" = current_model, "validation_scheme" = validation_scheme, "fold" = current_fold) 
+                          
+  output                = rbind(effect, output) }, warning = function(w) { cat("Warning occurred:", conditionMessage(w), "\n") },
+                                                   error   = function(e) { cat("Error occurred:",   conditionMessage(e), "\n") })  }}}
+                                                   
+  output                = output[, c("id", "country_year", setdiff(names(output), c("id", "country_year")))]                         
+  
+  saveRDS(output, paste0(path_output, "Validation/Validation_",validation_scheme,".rds")) 
+            
+  return() }
+#############################################################  
+#F) Run function
+#############################################################  
+
+Validation(phenotype_list, "country")
+Validation(phenotype_list, "cluster_10")
+Validation(phenotype_list, "cluster_random")
+
+#############################################################  
