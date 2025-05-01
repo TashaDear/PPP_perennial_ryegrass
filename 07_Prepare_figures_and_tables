@@ -1,0 +1,310 @@
+#WP1
+#Natasha Johansen
+#Date: 
+#############################################################
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+library(gridExtra)
+library(reshape2)
+library(stringr)
+library(tibble)
+library(tidyr)
+library(viridis)
+#############################################################
+#A) Paths
+#############################################################
+traits             = c("TDM3", "SpringCover", "WinterKill")                     
+models             = c("M1A", "M1B", "M2A", "M2B", "M3A", "M3B")
+
+#Paths
+path               = "/home/tasha/QGG_plants/ppp_updated/results/"
+#############################################################
+#B) Function to extract likelihood, variance, and heritability
+#############################################################
+
+extract_likelihood_and_variance = function() {
+  
+FM_output          = data.frame()
+  
+for(trait in traits){  
+
+for(model in models){
+      
+tryCatch({     
+        
+input              = readRDS(paste0(path, "model_output/Likelihoods/Likelihoods_",trait,".rds")) #change path
+        
+theta              = input[[model]]$NullModel$Sigma2 %>% as.data.frame() %>% rownames_to_column("component") %>% rename(theta = ".") %>% 
+                     mutate("heritability" = sum(theta[component == "A"]) / sum(theta[!component %in% c("W", "ET", "Env")]), 
+                            "trait" = trait, "model" = model, "total_var" = sum(theta)) %>% 
+                     group_by(component) %>% mutate(percentage = (theta/total_var) * 100) %>% ungroup() %>% select(-c("total_var"))
+          
+likelihood         = input[[model]]$NullModel$`LogLik (Reml)` %>% as.data.frame() %>% rename("llik" = ".") %>% mutate("trait" = trait, "model" = model)  
+output             = merge(likelihood, theta, by = c("model", "trait")) %>%
+                     mutate(approach = case_when(str_sub(model, -1) == "A" ~ "Reactionnorm",
+                                                 str_sub(model, -1) == "B" ~ "Envirotyping", TRUE ~ "Baseline")) %>%
+                     mutate(model_number = as.integer(gsub("[^0-9]", "", model))) %>%
+                     mutate_at(vars(theta, heritability, percentage), ~ round(., 2)) %>% 
+                     mutate(component = case_when(component %in% c("E")           ~ "Error",
+                                                  component %in% c("W", "ET")     ~ "Env",
+                                                  component %in% c("AxW", "AxET", "AxEnv") ~ "AxEnv",
+                                                  component %in% c("DxW", "DxET", "DxEnv") ~ "DxEnv", TRUE ~ component))
+      
+FM_output          = rbind(FM_output, output) }, error = function(e) { print(paste("An error occurred:", e)) }) }
+
+table_output       = FM_output %>%  select(c("model", "trait", "component", "percentage")) %>% 
+                     pivot_wider(names_from = component, values_from = percentage) %>% 
+                     mutate(across(where(is.numeric), round, digits = 1))
+
+png(paste0(path, "tables/Variance_components.png"), height=500, width=400)    #change path
+grid.arrange(tableGrob(table_output))
+dev.off()  } 
+  
+heritability       = FM_output %>% distinct(trait, model, heritability) %>% 
+                     pivot_wider(names_from = trait, values_from = heritability)
+  
+png(paste0(path, "/tables/Heritability.png"), height=200, width=400)          #change path
+grid.arrange(tableGrob(heritability))
+dev.off()  
+  
+return(FM_output)  }
+#############################################################
+#C) Function to perform likeliohood-ratio tests
+#############################################################
+
+llik_test          = function(input) {
+
+llr_output         = data.frame()
+pval_output        = data.frame()
+
+for(current_trait in traits) {
+
+for(current_approach in unique(input$approach)) {
+   
+current            = input %>% filter(trait == current_trait) %>% filter(approach == current_approach) %>% filter(component == "A")              
+            
+M1                 = current %>% filter(model_number == 1) %>% pull(llik)
+M2                 = current %>% filter(model_number == 2) %>% pull(llik)
+M3                 = current %>% filter(model_number == 3) %>% pull(llik)
+            
+M1M2               = 2 *(as.numeric(M2)-as.numeric(M1))
+M2M3               = 2 *(as.numeric(M3)-as.numeric(M2))
+M1M2_pval          = pchisq(M1M2, df = 1, lower.tail = FALSE)
+M2M3_pval          = pchisq(M2M3, df = 2, lower.tail = FALSE)
+
+llr_temp           = data.frame("M1-M2" = M1M2, "M2-M3" = M2M3) %>% mutate("approach" = current_approach, "trait" = current_trait) 
+pval_temp          = data.frame("M1-M2" = M1M2_pval, "M2-M3" = M2M3_pval) %>% mutate("approach" = current_approach, "trait" = current_trait) 
+    
+llr_output         = rbind(llr_output, llr_temp)                      
+pval_output        = rbind(pval_output, pval_temp)  
+
+pval_final         = pval_output %>% pivot_longer(cols = c("M1.M2", "M2.M3"), names_to = "comparison", values_to = "pval") %>%
+                     mutate(significance = case_when(pval < 0.001 ~ "***", pval < 0.01 ~ "**", pval < 0.05 ~ "*", TRUE ~ "NS")) }} 
+                     
+png(paste0(path, "tables/Likelihood_ratio_tests_llr_final.png"),  height=300, width=500) #change path
+grid.arrange(tableGrob(llr_output))
+dev.off()    
+                     
+png(paste0(path, "tables/Likelihood_ratio_tests_pval_final.png"), height=300, width=500) #change path
+grid.arrange(tableGrob(pval_final))
+dev.off()  }
+#############################################################
+#D) Function to plot variance components and heritability
+#############################################################
+
+create_plots       = function(FM_output) {
+
+FM_output_upd      = FM_output %>% 
+                     filter(component != "Env") %>% 
+                     mutate(trait = factor(trait, levels = traits), model_number = paste0("M", model_number))
+
+Variance_plot      = ggplot(FM_output_upd , aes(y = theta, x = trait, fill = component)) + 
+                     geom_bar(position = 'fill', stat = 'identity') + ylab("theta") + 
+                     guides(fill = guide_legend(title = "component")) + 
+                     theme_bw()  + 
+                     facet_grid(model_number ~ approach) +
+                     theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust = 1),
+                           plot.title  = element_text(hjust = 0.5, face = "bold")) +
+                     scale_fill_viridis(discrete = TRUE) +
+                     labs(y = "Variance (relative proportion)", x = "") 
+                                                
+Heritability_plot  = ggplot(FM_output_upd %>% distinct(trait, approach, model_number, heritability), 
+                     aes(y = heritability, x = model_number, fill = model_number)) + 
+                     geom_bar(stat = 'identity') +
+                     theme_bw() + 
+                     facet_grid(approach ~ trait) + 
+                     theme(legend.position = "none",
+                           axis.text.x     = element_text(angle = 90, vjust = 0.5, hjust = 1),
+                           plot.title      = element_text(hjust = 0.5, face = "bold")) +
+                     scale_fill_viridis(discrete = TRUE) + ylim(0, 1) +
+                     labs(y = "Narrow-sense heritability", x = "Model")  
+                     
+ggsave(paste0(path, "figures/Variance_final.png"),     plot = Variance_plot,     width = 6, height = 4)   #change path
+ggsave(paste0(path, "figures/Heritability_final.png"), plot = Heritability_plot, width = 6, height = 3) } #change path
+#############################################################
+#E) Extract model outputs and run test and construct plots
+#############################################################
+
+FM_output          = extract_likelihood_and_variance() 
+llik_output        = llik_test(FM_output)
+create_plots(FM_output)
+
+#############################################################
+#F) Prepare full models and validation models 
+#############################################################  
+                                         
+Val_cluster_rel    = readRDS(paste0(path, "model_output/Validation/Validation_cluster_10.rds"))      #change path
+Val_cluster_ran    = readRDS(paste0(path, "model_output/Validation/Validation_cluster_random.rds"))  #change path
+Val_country        = readRDS(paste0(path, "model_output/Validation/Validation_country.rds"))         #change path
+
+Val_combined       = rbind(Val_cluster_rel, rbind(Val_cluster_ran, Val_country)) %>%
+                     mutate(approach = ifelse(grepl("M[123]A", model), "Reactionnorm", "Envirotyping"),
+                            model    = paste0("M", str_extract(model, "[0-9]+"))) %>%
+                     filter(!is.na(yobs) & !is.na(ypred)) %>%
+                     mutate_at(vars(ypred, yobs, BLUPs_A, BLUPs_Env, BLUPs_AxEnv, BLUPs_D, BLUPs_DxEnv), as.numeric) %>%
+                     mutate(validation_scheme = case_when(validation_scheme == "country"        ~ "leave-one-country-out",
+                                                          validation_scheme == "cluster_10"     ~ "leave-one-genetic-cluster-out",
+                                                          validation_scheme == "cluster_random" ~ "leave-one-random-cluster-out",
+                     TRUE ~ validation_scheme), trait = factor(trait, levels = traits), analysis = "validation") 
+                                          
+Val_cor            = Val_combined %>%                    
+                     group_by(trait, approach, model, validation_scheme, fold) %>%
+                     summarize(yobs_ypred_corr = cor(ypred, yobs)) %>% 
+                     ungroup()
+        
+Val_cor_mean_sd    = Val_combined %>% 
+                     group_by(trait, approach, model, validation_scheme, fold) %>%
+                     summarize(yobs_ypred_corr = cor(ypred, yobs)) %>% 
+                     ungroup() %>% 
+                     group_by(trait, approach, model, validation_scheme) %>%
+                     summarize(yobs_ypred_mean = mean(yobs_ypred_corr), yobs_ypred_sd  = sd(yobs_ypred_corr)) %>% 
+                     ungroup() %>% 
+                     mutate(trait = factor(trait, levels = traits))
+                      
+#############################################################
+#G) Construct tables with validation output
+#############################################################
+
+for(current_trait in unique(Val_cor_mean_sd$trait)){
+validation_table   = Val_cor_mean_sd %>%
+                     select(trait, approach, model, validation_scheme, yobs_ypred_mean, yobs_ypred_sd) %>% 
+                     filter(trait == current_trait) %>% mutate(across(where(is.numeric), ~ round(., 2))) %>% 
+                     mutate(approach          = factor(approach, levels = c("Reactionnorm", "Envirotyping")),
+                            validation_scheme = factor(validation_scheme, 
+                            levels = c("leave-one-country-out", "leave-one-genetic-cluster-out", "leave-one-random-cluster-out"))) %>%
+                     arrange(approach, validation_scheme)
+                     
+png(paste0(path, "tables/Validation_mean_sd_", current_trait,"_final.png"), height=500, width=700) 
+grid.arrange(tableGrob(validation_table))
+dev.off()  }        
+                     
+#############################################################
+#H) Construct plots - compare improvement in prediction
+#############################################################
+
+Val_cor_improve   = Val_cor %>% pivot_wider(names_from = model, values_from = yobs_ypred_corr) %>% 
+                    mutate("M1M2" = M2-M1, "M2M3" = M3-M2, "M1M3" = M3-M1) %>% select(-c("M1", "M2", "M3")) %>% 
+                    pivot_longer(cols = c(M1M2, M2M3, M1M3),names_to = "comparison", values_to = "Difference") %>%
+                    filter(approach == "Reactionnorm") %>% filter(comparison == "M1M3") 
+
+Improvement_plot  = ggplot(Val_cor_improve, aes(fill = validation_scheme, y = Difference, x = validation_scheme)) + 
+                    geom_boxplot(position = position_dodge(width = 0.8), 
+                    outlier.shape = NA, aes(color = validation_scheme, fill = validation_scheme)) +
+                    stat_summary(fun = "mean", geom = "point", shape = 19, size = 0.5, color = "black", position = position_dodge(width = 0.8)) +
+                    facet_wrap( ~ trait, ncol = length(unique(Val_cor_improve$trait)), scales = "free_y") +  
+                    ylab("Increase/Decrease in PA") + ggtitle("") + xlab("") + 
+                    theme_bw() +
+                    theme(legend.key.size = unit(0.5, 'cm'),
+                          legend.title    = element_blank(),
+                          legend.text     = element_text(size  = 8),
+                          plot.title      = element_text(size  = 9, hjust = 0.5, face = "bold"),  
+                          plot.subtitle   = element_text(hjust = 0.5),
+                          axis.title.y    = element_text(size  = 10),
+                          axis.title.x    = element_text(size  = 10),
+                          axis.text.x     = element_blank(),
+                          strip.text      = element_text(size = 7)) + 
+                          guides(fill     = guide_legend(title ="")) +
+                          guides(color    = guide_legend(title ="")) +
+                          theme(legend.position = "bottom") +
+                    scale_fill_viridis(discrete = TRUE) +
+                    scale_color_viridis(discrete = TRUE) +
+                    geom_hline(yintercept = 0, linetype = "dashed", color = "black") + 
+                    guides(color="none") +
+                    guides(fill="none") +
+                    guides(fill = guide_legend(nrow = 1)) 
+                    
+ggsave(paste0(path, "figures/Compare_improvement_validation_plot_M1M3_final.png"), plot = Improvement_plot, width = 7, height = 3) 
+#############################################################
+#I) Construct plots - compare environment-specific prediction, part A
+#############################################################
+
+Val_country_M3     = Val_cor %>% filter(validation_scheme == "leave-one-country-out" & model == "M3") %>% 
+                     distinct(validation_scheme, trait, approach, model, fold, yobs_ypred_corr) %>%
+                     filter(approach == "Reactionnorm")
+
+Compare_folds_plot = ggplot(Val_country_M3[, c("fold", "trait", "yobs_ypred_corr")], 
+                     aes(x = trait, y = fold, fill = yobs_ypred_corr)) +
+                     geom_tile(color = "white") +
+                     geom_text(aes(label = round(yobs_ypred_corr, 3)), color = "white", size = 3, na.rm = TRUE) +
+                     scale_fill_viridis_c(option = "D", na.value = "grey", limits = c(0, 1), name = "PA") +
+                     labs(title = "", x = "", y = "") +
+                     theme_bw() + 
+                     theme(plot.title      = element_text(hjust = 0.5),
+                           axis.text.x     = element_text(size = 10, angle = 45, hjust = 1), 
+                           legend.title    = element_text(vjust = 1),
+                           legend.position = "right")
+
+ggsave(paste0(path, "figures/Compare_folds_vs_country_plot_final.png"), plot = Compare_folds_plot, width = 6, height = 5) 
+#############################################################
+#J) Construct plots - compare model parameter correlations
+#############################################################
+                                     
+Val_cor_M3         = Val_combined %>% filter(model == "M3") %>% filter(approach == "Reactionnorm") %>%                     
+                     group_by(trait, approach, model, validation_scheme, fold) %>%
+                     summarize(yobs_ypred_corr = cor(ypred, yobs),
+                               yobs_A_corr     = cor(BLUPs_A, yobs),
+                               yobs_AxEnv_corr = cor(BLUPs_AxEnv, yobs),
+                               yobs_D_corr     = cor(BLUPs_D, yobs),
+                               yobs_DxEnv_corr = cor(BLUPs_DxEnv, yobs)) %>% ungroup() %>% 
+                     rename("Pred" = "yobs_ypred_corr", "A" = "yobs_A_corr", "D" = "yobs_D_corr",
+                            "AxEnv" = "yobs_AxEnv_corr", "DxEnv" = "yobs_DxEnv_corr") %>%
+                     pivot_longer(cols = c(Pred, A, D, AxEnv, DxEnv), names_to = "component", values_to = "correlation")
+
+Compare_com_plot    = ggplot(Val_cor_M3, aes(fill = validation_scheme, y = correlation, x = validation_scheme)) + 
+                      geom_boxplot(position = position_dodge(width = 0.8), outlier.shape = NA, 
+                      aes(color = validation_scheme, fill = validation_scheme)) +
+                      stat_summary(fun = "mean", geom = "point", shape = 19, size = 0.5, color = "black", position = position_dodge(width = 0.8)) +
+                      facet_grid(trait ~ component) +  
+                      ylab("Prediction accuracy") + ggtitle("") + xlab("") + ylim(-1, 1) + 
+                      theme_bw() +
+                      theme(legend.key.size = unit(0.5, 'cm'),
+                            legend.title    = element_text(size  = 10), 
+                            legend.text     = element_text(size  = 10),
+                            plot.title      = element_text(size  = 9, hjust = 0.5, face = "bold"),  
+                            plot.subtitle   = element_text(hjust = 0.5),
+                            axis.title.y    = element_text(size  = 10),
+                            axis.title.x    = element_text(size  = 10),
+                            axis.text.x     = element_blank(),
+                            strip.text      = element_text(size = 9)) + 
+                            guides(fill     = guide_legend(title ="")) +
+                            theme(legend.position = "bottom") +
+                            scale_fill_viridis(discrete = TRUE) +
+                            scale_color_viridis(discrete = TRUE) +
+                      geom_hline(yintercept = 0, linetype = "dashed", color = "black") + 
+                      guides(color="none") +
+                      guides(fill = guide_legend(nrow = 1)) +
+                      guides(fill = guide_legend(title = NULL))
+                                 
+ggsave(paste0(path, "figures/Compare_components_validation_plot_final.png"), plot = Compare_com_plot, width = 7, height = 5) 
+
+for(current_component in unique(Val_cor_M3$component)){
+
+component_table    = Val_cor_M3 %>% filter(component == current_component) %>% 
+                     group_by(trait, approach, model, validation_scheme, component) %>%
+                     summarize(mean_cor = mean(correlation), sd_cor   = sd(correlation)) %>% mutate_if(is.numeric, ~ round(., 2)) 
+                            
+png(paste0(path, "tables/Component_table_", current_component,"_final.png"), height=300, width=600)
+grid.arrange(tableGrob(component_table))
+dev.off() }                       
+#############################################################
